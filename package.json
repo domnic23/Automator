@@ -1,0 +1,15 @@
+{
+  "name": "automator",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "bin": { "automator": "./src/cli.js" },
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "links": "node src/cli.js links",
+    "probe": "node tools/probe-idm.js"
+  },
+  "dependencies": {
+    "playwright-core": "^1.49.0"
+  }
+}

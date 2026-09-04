@@ -1,0 +1,11 @@
+# Installed packages
+node_modules/
+
+# Downloaded files — can be huge
+downloads/
+
+# Chrome profile: holds cookies and session data, never publish it
+browser-profile/
+
+# Run logs are personal to each machine
+state/*.jsonl
