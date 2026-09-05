@@ -73,6 +73,18 @@ export class RunLog {
     return reset;
   }
 
+  /** Put every failed entry back in the queue. Used by the retry command. */
+  resetFailed() {
+    let reset = 0;
+    for (const [id, row] of this.entries) {
+      if (row.status === STATUS.FAILED) {
+        this.entries.set(id, { ...row, status: STATUS.PENDING, error: '' });
+        reset++;
+      }
+    }
+    return reset;
+  }
+
   /** Record a status change. Written through to disk immediately. */
   record(id, fields) {
     const row = {

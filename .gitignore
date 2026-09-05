@@ -7,5 +7,5 @@ downloads/
 # Chrome profile: holds cookies and session data, never publish it
 browser-profile/
 
-# Run logs are personal to each machine
-state/*.jsonl
+# Run logs are personal to each machine, wherever they are kept
+*.jsonl

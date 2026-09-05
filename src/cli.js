@@ -13,7 +13,13 @@ import { parseArgs } from 'node:util';
 import { loadPaste, PasteError } from './paste.js';
 import { RunLog, STATUS, linkId, runLogPath } from './state.js';
 import { openBrowser, resolveLink } from './resolve.js';
-import { findIdm, idmSettingsPresent, IdmError } from './idm.js';
+import {
+  findIdm,
+  ensureIdmRunning,
+  idmSettingsPresent,
+  isCompleteOnDisk,
+  IdmError,
+} from './idm.js';
 import { Scheduler } from './queue.js';
 import { buildRows, toMarkdown, toCsv } from './report.js';
 
@@ -25,16 +31,27 @@ Automator — paste links to IDM
   links   <paste-url>                 decrypt the paste and list the links
   resolve <page-url>                  resolve one link to its direct file URL
   run     <paste-url>                 download everything through IDM
+  retry   [run-file]                  redo only the failed files of a past run
   report  [run-file]                  print a table of a finished run
 
-Options for "run":
+Options for "run" and "retry":
   --max <n>        how many downloads may be active at once   (default 3)
   --dir <path>     where to save files                        (default .\\downloads)
   --idm <path>     full path to IDMan.exe                     (auto-detected)
-  --password <s>   paste password, if the paste has one
   --headless       hide the browser window (only after a headed first run)
-  --stall <min>    give up on a download after this many idle minutes (default 30)
-  --csv            for "report": print CSV instead of a table
+  --stall <min>    give up after this many idle minutes        (default 30)
+  --start-timeout <min>
+                   how long to wait for a file to appear before
+                   checking whether IDM has gone idle          (default 45)
+
+Options for "run":
+  --password <s>   paste password, if the paste has one
+
+Options for "retry":
+  --check-only     only compare against the folder, download nothing
+
+Options for "report":
+  --csv            print CSV instead of a table
 `.trim();
 
 async function main() {
@@ -47,6 +64,8 @@ async function main() {
       password: { type: 'string', default: '' },
       headless: { type: 'boolean', default: false },
       stall: { type: 'string', default: '30' },
+      'start-timeout': { type: 'string', default: '45' },
+      'check-only': { type: 'boolean', default: false },
       csv: { type: 'boolean', default: false },
       help: { type: 'boolean', default: false },
     },
@@ -65,6 +84,8 @@ async function main() {
       return cmdResolve(target, values);
     case 'run':
       return cmdRun(target, values);
+    case 'retry':
+      return cmdRetry(target, values);
     case 'report':
       return cmdReport(target, values);
     default:
@@ -96,9 +117,8 @@ async function cmdResolve(pageUrl, values) {
   }
 }
 
-async function cmdRun(pasteUrl, values) {
-  requireArg(pasteUrl, 'run <paste-url>');
-
+/** Shared option checks and IDM setup for the two downloading commands. */
+async function prepareDownload(values) {
   const max = Number(values.max);
   if (!Number.isInteger(max) || max < 1 || max > 32) {
     throw new Error('--max must be a whole number between 1 and 32');
@@ -107,12 +127,17 @@ async function cmdRun(pasteUrl, values) {
   if (!Number.isFinite(stallMs) || stallMs <= 0) {
     throw new Error('--stall must be a positive number of minutes');
   }
+  const startTimeoutMs = Number(values['start-timeout']) * 60000;
+  if (!Number.isFinite(startTimeoutMs) || startTimeoutMs <= 0) {
+    throw new Error('--start-timeout must be a positive number of minutes');
+  }
 
   const dir = path.resolve(values.dir ?? 'downloads');
   fs.mkdirSync(dir, { recursive: true });
 
   const idmExe = findIdm(values.idm);
   console.log(`IDM      : ${idmExe}`);
+  if (await ensureIdmRunning(idmExe)) console.log('           (started IDM)');
   console.log(`Saving to: ${dir}`);
 
   if (!(await idmSettingsPresent())) {
@@ -125,6 +150,44 @@ async function cmdRun(pasteUrl, values) {
         '      the extra jobs wait in IDM. Check IDM > Downloads > Options.',
     );
   }
+
+  return { max, stallMs, startTimeoutMs, dir, idmExe };
+}
+
+/** Seed a scheduler with the given rows and run it to completion. */
+async function driveDownloads(rows, { max, stallMs, startTimeoutMs, dir, idmExe }, log, values) {
+  const browser = await openBrowser({ headless: values.headless });
+  const scheduler = new Scheduler({
+    idmExe,
+    browser,
+    log,
+    dir,
+    max,
+    stallMs,
+    startTimeoutMs,
+    onUpdate: printProgress,
+  });
+
+  const todo = scheduler.seed(rows);
+  console.log(`${todo} to download, ${max} at a time.\n`);
+
+  const stop = () => {
+    console.log('\nStopping after the current tick. Progress is saved.');
+    scheduler.stop();
+  };
+  process.on('SIGINT', stop);
+
+  try {
+    await scheduler.run();
+  } finally {
+    process.off('SIGINT', stop);
+    await browser.close().catch(() => {});
+  }
+}
+
+async function cmdRun(pasteUrl, values) {
+  requireArg(pasteUrl, 'run <paste-url>');
+  const setup = await prepareDownload(values);
 
   console.log('\nReading paste...');
   const { links } = await loadPaste(pasteUrl, values.password);
@@ -140,32 +203,71 @@ async function cmdRun(pasteUrl, values) {
     );
   }
 
-  const browser = await openBrowser({ headless: values.headless });
-  const scheduler = new Scheduler({
-    idmExe,
-    browser,
-    log,
-    dir,
-    max,
-    stallMs,
-    onUpdate: printProgress,
-  });
+  await driveDownloads(withIds, setup, log, values);
 
-  const todo = scheduler.seed(withIds);
-  console.log(`${todo} to download, ${max} at a time.\n`);
+  console.log('\n' + toMarkdown(buildRows(log.file)));
+  console.log(`\nRun log: ${log.file}`);
+}
 
-  const stop = () => {
-    console.log('\nStopping after the current tick. Progress is saved.');
-    scheduler.stop();
-  };
-  process.on('SIGINT', stop);
+/**
+ * Redo only the files a past run marked failed.
+ *
+ * Everything needed is already in the run log, so the paste is never fetched
+ * and the files that succeeded are never touched.
+ */
+async function cmdRetry(file, values) {
+  const logFile = file ?? newestRunLog();
+  if (!logFile) throw new Error('no run log found — pass one: retry <run-file>');
 
-  try {
-    await scheduler.run();
-  } finally {
-    process.off('SIGINT', stop);
-    await browser.close().catch(() => {});
+  const log = new RunLog(logFile).load();
+  const failed = [...log.entries.values()].filter(
+    (r) => r.status === STATUS.FAILED,
+  );
+  console.log(`Run log  : ${logFile}`);
+  if (!failed.length) {
+    console.log('Nothing failed in that run. Nothing to do.');
+    return;
   }
+
+  const dir = path.resolve(values.dir ?? 'downloads');
+  console.log(`Checking : ${dir}`);
+  console.log(`Failed   : ${failed.length}\n`);
+
+  // Some "failures" were only ever a timeout — the file may already be there.
+  const missing = [];
+  let recovered = 0;
+  for (const row of failed) {
+    if (isCompleteOnDisk(dir, row.filename, row.size)) {
+      log.record(row.id, { status: STATUS.DONE, bytes: row.size });
+      recovered++;
+    } else {
+      missing.push(row);
+    }
+  }
+
+  console.log(`Already complete on disk : ${recovered}`);
+  console.log(`Still need downloading   : ${missing.length}`);
+
+  if (recovered === 0 && failed.length > 0) {
+    console.warn(
+      `\nwarning: none of the ${failed.length} files were found in that folder.\n` +
+        '         If the run saved somewhere else, pass the right --dir.',
+    );
+  }
+
+  if (values['check-only']) {
+    console.log('\n--check-only was set, so nothing was downloaded.');
+    return;
+  }
+  if (!missing.length) {
+    console.log('\nEverything is already on disk. Nothing to download.');
+    console.log('\n' + toMarkdown(buildRows(log.file)));
+    return;
+  }
+
+  const setup = await prepareDownload(values);
+  log.resetFailed();
+  await driveDownloads(missing, setup, log, values);
 
   console.log('\n' + toMarkdown(buildRows(log.file)));
   console.log(`\nRun log: ${log.file}`);

@@ -5,7 +5,7 @@
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
 
 const run = promisify(execFile);
@@ -49,6 +49,84 @@ async function readRegValue(key, name) {
  */
 export async function idmSettingsPresent() {
   return (await readRegValue(IDM_REG_KEY, 'ExePath')) !== null;
+}
+
+/**
+ * Total bytes IDM is holding in its partial-download area.
+ *
+ * IDM does not write into the target folder until a download finishes, so this
+ * is the only cheap way to ask "is IDM still moving bytes?". Scanning a folder
+ * tree is not free, so callers must only use this when a file already looks
+ * stuck — never on the normal poll tick.
+ *
+ * Returns null when the folder cannot be located or read.
+ */
+export async function idmTempBytes() {
+  const appData = await readRegValue(IDM_REG_KEY, 'AppDataIDMFolder');
+  const roots = [
+    appData && path.join(appData, 'DwnlData'),
+    path.join(process.env.APPDATA ?? '', 'IDM', 'DwnlData'),
+  ].filter(Boolean);
+
+  for (const root of roots) {
+    if (fs.existsSync(root)) return sumTree(root);
+  }
+  return null;
+}
+
+function sumTree(dir) {
+  let total = 0;
+  for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+    const full = path.join(dir, entry.name);
+    try {
+      if (entry.isDirectory()) total += sumTree(full);
+      else total += fs.statSync(full).size;
+    } catch {
+      // a temp file can vanish mid-scan; skip it
+    }
+  }
+  return total;
+}
+
+/** True when the finished file is already sitting on disk at its full size. */
+export function isCompleteOnDisk(dir, filename, size) {
+  if (!size) return false;
+  const target = path.join(dir, filename);
+  try {
+    return fs.statSync(target).size === size;
+  } catch {
+    return false;
+  }
+}
+
+async function isIdmRunning() {
+  try {
+    const { stdout } = await run('tasklist', ['/FI', 'IMAGENAME eq IDMan.exe']);
+    return stdout.includes('IDMan.exe');
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Make sure IDM is already open before we queue anything.
+ *
+ * This matters more than it looks. When IDM is not running, "IDMan.exe /d ..."
+ * does not hand a job to IDM and exit — it *becomes* the IDM application and
+ * never returns, so the queueing call would hang and then be killed, taking
+ * IDM with it. Against a running instance the same call returns in about
+ * 300 ms. Returns true if we had to start IDM.
+ */
+export async function ensureIdmRunning(idmExe) {
+  if (await isIdmRunning()) return false;
+
+  spawn(idmExe, [], { detached: true, stdio: 'ignore', windowsHide: true }).unref();
+
+  for (let i = 0; i < 30; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    if (await isIdmRunning()) return true;
+  }
+  throw new IdmError('IDM would not start. Open Internet Download Manager, then try again.');
 }
 
 /** Add one file to IDM's queue without starting it. */

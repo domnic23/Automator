@@ -118,6 +118,9 @@ export async function resolveLink(context, pageUrl, { timeoutMs = 90000 } = {}) 
     const hadToken = await waitForToken(page);
 
     const res = await requestDirectUrl(page);
+    if (res.status === 404 || res.status === 410) {
+      throw new ResolveError('link is dead or expired (host replied 404)');
+    }
     if (res.status !== 200) {
       throw new ResolveError(
         hadToken

@@ -6,7 +6,7 @@
 
 import { STATUS } from './state.js';
 import { resolveLink, ResolveError } from './resolve.js';
-import { enqueue, startQueue, checkProgress } from './idm.js';
+import { enqueue, startQueue, checkProgress, idmTempBytes } from './idm.js';
 
 const TICK_MS = 2000;
 
@@ -18,7 +18,7 @@ export class Scheduler {
     dir,
     max,
     stallMs = 30 * 60 * 1000,
-    startTimeoutMs = 15 * 60 * 1000,
+    startTimeoutMs = 45 * 60 * 1000,
     onUpdate = () => {},
   }) {
     this.idmExe = idmExe;
@@ -34,6 +34,8 @@ export class Scheduler {
     this.active = new Map();
     this.filling = 0;
     this.stopped = false;
+    // Last reading of IDM's partial-download area, for the stuck check below.
+    this.lastTempBytes = null;
   }
 
   /** Queue up every link that is not already finished. */
@@ -134,16 +136,22 @@ export class Scheduler {
     for (const [id, item] of [...this.active]) {
       const { state, bytes } = checkProgress(item, { stallMs: this.stallMs });
 
-      // IDM accepted the job but never put a byte on disk. Without this the
-      // slot would be held for the whole run.
+      // IDM writes nothing into the target folder until a download finishes,
+      // so "missing" is the normal state for the whole download. Only give up
+      // once IDM itself has gone idle — see isIdmIdle().
       if (state === 'missing') {
         if (Date.now() - item.queuedAt > this.startTimeoutMs) {
-          this.active.delete(id);
-          this.log.record(id, {
-            status: STATUS.FAILED,
-            startedAt: item.startedAt,
-            error: `IDM never started this download within ${Math.round(this.startTimeoutMs / 60000)} min`,
-          });
+          if (await this.isIdmIdle()) {
+            this.active.delete(id);
+            this.log.record(id, {
+              status: STATUS.FAILED,
+              startedAt: item.startedAt,
+              error: `no file after ${Math.round(this.startTimeoutMs / 60000)} min and IDM was idle`,
+            });
+          } else {
+            // IDM is still moving bytes, so this file is just slow.
+            item.queuedAt = Date.now();
+          }
         }
         continue;
       }
@@ -170,6 +178,29 @@ export class Scheduler {
         });
       }
     }
+  }
+
+  /**
+   * Has IDM stopped working entirely?
+   *
+   * This scans a folder tree, so it is only called when a file has already
+   * passed its soft limit — never on the normal tick. If IDM's partial data
+   * has grown since the last look, IDM is alive and nothing is stuck.
+   */
+  async isIdmIdle() {
+    const bytes = await idmTempBytes();
+    if (bytes === null) return true; // cannot tell; fall back to the timer
+
+    // First look has nothing to compare against, so take a baseline and give
+    // the file another window rather than failing it on no evidence.
+    if (this.lastTempBytes === null) {
+      this.lastTempBytes = bytes;
+      return false;
+    }
+
+    const grew = bytes > this.lastTempBytes;
+    this.lastTempBytes = bytes;
+    return !grew;
   }
 
   fail(item, error) {
